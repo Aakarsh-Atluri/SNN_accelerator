@@ -1,44 +1,120 @@
-`timescale 1ns / 1ps
-
 module lif_neuron #(
-    parameter THRESHOLD  = 16'sd1000,  // Firing threshold (signed)
-    parameter LEAK_SHIFT = 3,          // Leakage = state >> LEAK_SHIFT (divide by 8)
-    parameter REF_PERIOD = 3'd5        // Refractory cycles after firing
+    parameter WIDTH      = 32,
+    parameter THRESHOLD  = 100,
+    parameter RESET_VAL  = 0,
+    parameter LEAK_SHIFT = 3
 )(
-    input  wire        clk,
-    input  wire        rst_n,          // Active-low synchronous reset
-    // Input from cascaded_adder
-    input  wire signed [15:0] current_in,   // Weighted spike sum
-    input  wire               current_valid, // current_in is valid this cycle
-    // Output
-    output reg         spike_out        // 1 = neuron fired this cycle
+    input  wire clk,
+    input  wire rst,
+
+    // Input current
+    input  wire signed [WIDTH-1:0] current_in,
+    input  wire current_valid,
+
+    // Outputs
+    output reg spike_out,
+    output reg spike_valid,
+
+    // Debug visibility
+    output reg signed [WIDTH-1:0] membrane_out
 );
 
-    reg signed [15:0] membrane;        // Membrane potential
-    reg [2:0]         ref_counter;     // Refractory countdown
+    // Internal Registers
 
-    always @(posedge clk) begin
-        if (!rst_n) begin
-            membrane    <= 16'sd0;
-            ref_counter <= 3'd0;
-            spike_out   <= 1'b0;
+    reg signed [WIDTH-1:0] membrane;
+    reg signed [WIDTH-1:0] leak_value;
+    reg signed [WIDTH-1:0] next_membrane;
+
+    integer cycle;
+
+
+    //using Combinational Logic for next state, fixed timing errors
+
+    always @(*) begin
+
+        // arithmetic shift preserves sign
+        leak_value = membrane >>> LEAK_SHIFT;
+
+        // default
+        next_membrane = membrane - leak_value;
+
+        // add input current
+        if (current_valid)
+            next_membrane = next_membrane + current_in;
+    end
+
+    // ============================================================
+    // Sequential Logic
+    // ============================================================
+
+    always @(posedge clk or posedge rst) begin
+
+        if (rst) begin
+
+            membrane     <= RESET_VAL;
+            membrane_out <= RESET_VAL;
+
+            spike_out    <= 0;
+            spike_valid  <= 0;
+
+            cycle        <= 0;
+
         end else begin
-            spike_out <= 1'b0;  // Default: no spike
 
-            if (ref_counter > 0) begin
-                // In refractory period: hold membrane at zero, count down
-                ref_counter <= ref_counter - 1;
-                membrane    <= 16'sd0;
-            end else if (current_valid) begin
-                // Leaky integration: V(t+1) = V(t) - V(t)/tau + I(t)
-                // Leakage implemented as arithmetic right-shift (divide by 2^LEAK_SHIFT)
-                if (membrane + current_in - (membrane >>> LEAK_SHIFT) >= THRESHOLD) begin
-                    // Threshold crossed: fire and reset
-                    spike_out   <= 1'b1;
-                    membrane    <= 16'sd0;
-                    ref_counter <= REF_PERIOD;
-                end else begin
-                    membrane <= membrane - (membrane >>> LEAK_SHIFT) + current_in;
+            cycle <= cycle + 1;
+
+            // default
+            spike_valid <= 0;
+            spike_out   <= 0;
+
+            // Update only when "current_valid" arrives
+
+            if (current_valid) begin
+
+                $display(
+                    "[LIF %0d] INPUT | membrane=%0d | leak=%0d | current=%0d | next_membrane=%0d",
+                    cycle,
+                    membrane,
+                    leak_value,
+                    current_in,
+                    next_membrane
+                );
+
+                // Spike condition
+
+                if (next_membrane >= THRESHOLD) begin
+
+                    membrane <= RESET_VAL;
+
+                    membrane_out <= RESET_VAL;
+
+                    spike_out   <= 1;
+                    spike_valid <= 1;
+
+                    $display(
+                        "[LIF %0d] SPIKE | threshold=%0d exceeded | membrane_reset=%0d",
+                        cycle,
+                        THRESHOLD,
+                        RESET_VAL
+                    );
+                end
+
+
+                // Normal membrane update
+
+                else begin
+
+                    membrane <= next_membrane;
+
+                    membrane_out <= next_membrane;
+
+                    spike_valid <= 1;
+
+                    $display(
+                        "[LIF %0d] UPDATE | new_membrane=%0d",
+                        cycle,
+                        next_membrane
+                    );
                 end
             end
         end
