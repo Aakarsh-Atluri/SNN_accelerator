@@ -28,7 +28,7 @@ module snn_top (
     // -------------------------------------------------------------------------
     localparam N         = 4096;
     localparam W         = 16;
-    localparam OUT       = 28;
+    localparam OUT       = 32;
     localparam T_WINDOW  = 25;
     localparam CLK_FREQ  = 100_000_000;
     localparam BAUD_RATE = 115200;
@@ -70,7 +70,7 @@ module snn_top (
 
     // lif_neuron → master_fsm
     wire lif_spike_out;
-
+	
     // master_fsm → spike_counter
     wire sc_start;
     wire sc_spike_valid;
@@ -147,7 +147,7 @@ module snn_top (
         .OUT(OUT)
     ) u_mac (
         .clk         (clk),
-        .rst_n       (rst_n),
+        .rst       (rst_n),
         .start       (adder_start),
         .spike_in    (spike_bit),
         .spike_valid (spike_valid),
@@ -160,15 +160,18 @@ module snn_top (
 
     // ---- 5. LIF Neuron -------------------------------------------------------
     lif_neuron #(
-        .THRESHOLD (16'sd1000),
+        .THRESHOLD (32'sd1000),
         .LEAK_SHIFT(3),
-        .REF_PERIOD(3'd5)
+        .RESET_VAL(0),
+		  .WIDTH(32)
     ) u_lif (
         .clk           (clk),
-        .rst_n         (rst_n),
-        .current_in    (adder_result[15:0]),   // Take lower 16 bits of 28-bit result
+        .rst         (~rst_n),
+        .current_in    (adder_result[31:0]),   // Take lower 16 bits of 28-bit result
         .current_valid (lif_current_valid),
-        .spike_out     (lif_spike_out)
+        .spike_out     (lif_spike_out),
+		  .spike_valid   (lif_spike_valid),
+		  .membrane_out  ()
     );
 
     // ---- 6. Spike Counter (Rate Decoder) -------------------------------------
