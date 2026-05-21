@@ -70,6 +70,7 @@ module snn_top (
 
     // lif_neuron → master_fsm
     wire lif_spike_out;
+	wire lif_spike_valid
 	
     // master_fsm → spike_counter
     wire sc_start;
