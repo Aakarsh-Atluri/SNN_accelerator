@@ -59,7 +59,7 @@ assign issue_addr = issue_count[ADDR_W-1:0];
 // ---------------------------------------------------------------------------
 // Main sequential logic
 // ---------------------------------------------------------------------------
-    always @(negedge clk or negedge rst) begin
+    always @(posedge clk or posedge rst) begin
     if (rst) begin
         acc           <= {OUT{1'b0}};
         result        <= {OUT{1'b0}};
