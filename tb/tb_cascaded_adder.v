@@ -70,7 +70,7 @@ module tb_cascaded_adder;
     reg signed [W-1:0] mem [0:N-1];
 
     always @(*) begin
-        weight_data = mem[weight_addr];
+        weight_data <= mem[weight_addr];
     end
 
     // ============================================================
