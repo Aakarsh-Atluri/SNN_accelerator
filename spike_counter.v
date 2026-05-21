@@ -51,8 +51,8 @@ module spike_counter #(
                             // Final timestep: latch last sample and decide
                             if (spike_in) count_1 <= count_1 + 1;
                             else          count_0 <= count_0 + 1;
-                            result <= (count_1 + spike_in > count_0 + ~spike_in)
-                                      ? 1'b1 : 1'b0;
+                            result <= (count_1 + (spike_in ? 1 : 0) > count_0 + (spike_in ? 0 : 1))
+                                ? 1'b1 : 1'b0;
                             done  <= 1'b1;
                             state <= IDLE;
                         end
