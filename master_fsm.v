@@ -43,15 +43,16 @@ module master_fsm #(
     // -------------------------------------------------------------------------
     // State encoding
     // -------------------------------------------------------------------------
-    localparam S_IDLE         = 4'd0;
+ localparam S_IDLE         = 4'd0;
     localparam S_WAIT_WEIGHTS = 4'd1;
     localparam S_WAIT_SPIKES  = 4'd2;
     localparam S_STREAM       = 4'd3;
     localparam S_WAIT_MAC     = 4'd4;
-    localparam S_LIF_STEP     = 4'd5;
-    localparam S_CHECK_WIN    = 4'd6;
-    localparam S_DECIDE       = 4'd7;
-    localparam S_SEND_RESULT  = 4'd8;
+    localparam S_WAIT_LIF     = 4'd5;  // <--- NEW STATE
+    localparam S_LIF_STEP     = 4'd6;
+    localparam S_CHECK_WIN    = 4'd7;
+    localparam S_DECIDE       = 4'd8;
+    localparam S_SEND_RESULT  = 4'd9;
 
     reg [3:0] state;
 
@@ -129,11 +130,21 @@ module master_fsm #(
                 end
 
                 // ---- Wait for MAC result ------------------------------------
+					
+               
+
+                // ---- LIF processes the MAC result for one timestep ----------
+             
                 S_WAIT_MAC: begin
                     if (adder_valid) begin
                         lif_current_valid <= 1;  // Present result to LIF
-                        state             <= S_LIF_STEP;
+                        state             <= S_WAIT_LIF;
                     end
+                end
+					 
+					  // ---- Wait 1 cycle for LIF to update spike_out ---------------
+                S_WAIT_LIF: begin
+                    state <= S_LIF_STEP;
                 end
 
                 // ---- LIF processes the MAC result for one timestep ----------
