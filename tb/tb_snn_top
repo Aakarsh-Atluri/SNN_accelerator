@@ -1,0 +1,429 @@
+`timescale 1ns / 1ps
+
+// =============================================================================
+// Comprehensive Testbench for SNN_TOP Module
+// Tests the complete SNN accelerator with 4096 weights
+// =============================================================================
+
+module tb_snn_top;
+
+    // =========================================================================
+    // Parameters - Matching the top module
+    // =========================================================================
+    localparam N         = 4096;
+    localparam W         = 16;
+    localparam OUT       = 32;
+    localparam T_WINDOW  = 25;
+    localparam CLK_FREQ  = 100_000_000;
+    localparam BAUD_RATE = 115200;
+    
+    // For faster simulation
+    localparam CLK_PERIOD = 10;  // 10ns = 100MHz
+    localparam BAUD_PERIOD = 8680; // ns per UART bit at 115200 baud
+    
+    // =========================================================================
+    // Testbench Signals
+    // =========================================================================
+    reg  clk;
+    reg  rst_n;
+    reg  rx;
+    wire tx;
+    wire result_led;
+    wire done_led;
+    
+    // Test control
+    integer i, j, k;
+    integer error_count;
+    integer test_num;
+    
+    // Weight and spike data
+    reg signed [15:0] test_weights [0:N-1];
+    reg [7:0] spike_bytes [0:511];  // 512 bytes = 4096 bits
+    
+    // =========================================================================
+    // DUT Instantiation
+    // =========================================================================
+    snn_top dut (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .rx         (rx),
+        .tx         (tx),
+        .result_led (result_led),
+        .done_led   (done_led)
+    );
+    
+    // =========================================================================
+    // Clock Generation - 100MHz
+    // =========================================================================
+    initial begin
+        clk = 0;
+        forever #(CLK_PERIOD/2) clk = ~clk;
+    end
+    
+    // =========================================================================
+    // Task: UART Transmit Byte (testbench sends to DUT)
+    // Format: 8N1 (8 data bits, no parity, 1 stop bit)
+    // =========================================================================
+    task uart_tx_byte;
+        input [7:0] data;
+        integer bit_idx;
+        begin
+            // Start bit (0)
+            rx = 0;
+            #BAUD_PERIOD;
+            
+            // Data bits (LSB first)
+            for (bit_idx = 0; bit_idx < 8; bit_idx = bit_idx + 1) begin
+                rx = data[bit_idx];
+                #BAUD_PERIOD;
+            end
+            
+            // Stop bit (1)
+            rx = 1;
+            #BAUD_PERIOD;
+        end
+    endtask
+    
+    // =========================================================================
+    // Task: UART Receive Byte (testbench receives from DUT)
+    // =========================================================================
+    task uart_rx_byte;
+        output [7:0] data;
+        integer bit_idx;
+        begin
+            data = 8'h00;
+            
+            // Wait for start bit
+            wait(tx == 0);
+            #(BAUD_PERIOD/2);  // Move to middle of start bit
+            
+            // Sample data bits
+            for (bit_idx = 0; bit_idx < 8; bit_idx = bit_idx + 1) begin
+                #BAUD_PERIOD;
+                data[bit_idx] = tx;
+            end
+            
+            // Wait for stop bit
+            #BAUD_PERIOD;
+        end
+    endtask
+    
+    // =========================================================================
+    // Task: Load Weights into BRAM via UART
+    // =========================================================================
+    task load_weights;
+        integer weight_idx;
+        reg [7:0] msb, lsb;
+        begin
+            $display("\n[TB %0t] ========================================", $time);
+            $display("[TB %0t] Loading %0d weights into BRAM...", $time, N);
+            $display("[TB %0t] ========================================", $time);
+            
+            // Send weight loading command (0xAA)
+            uart_tx_byte(8'hAA);
+            #1000;  // Small delay
+            
+            // Send all 4096 weights (8192 bytes total)
+            for (weight_idx = 0; weight_idx < N; weight_idx = weight_idx + 1) begin
+                msb = test_weights[weight_idx][15:8];
+                lsb = test_weights[weight_idx][7:0];
+                
+                uart_tx_byte(msb);
+                uart_tx_byte(lsb);
+                
+                if ((weight_idx % 512) == 0) begin
+                    $display("[TB %0t] Loaded %0d/%0d weights", $time, weight_idx, N);
+                end
+            end
+            
+            // Wait for weights_loaded flag
+            #10000;
+            $display("[TB %0t] Weight loading complete!", $time);
+            $display("[TB %0t] weights_loaded = %b", $time, dut.weights_loaded);
+        end
+    endtask
+    
+    // =========================================================================
+    // Task: Send One Timestep of Spikes (4096 spikes = 512 bytes)
+    // =========================================================================
+    task send_spike_timestep;
+        input [511:0] spike_pattern;  // Can pass custom pattern
+        integer byte_idx;
+        reg [7:0] rx_ack;
+        begin
+            // Send spike request command (0xBB)
+            uart_tx_byte(8'hBB);
+            
+            // Wait for ACK from DUT
+            uart_rx_byte(rx_ack);
+            if (rx_ack != 8'h01) begin
+                $display("[TB %0t] ERROR: Expected ACK 0x01, got 0x%02h", $time, rx_ack);
+                error_count = error_count + 1;
+            end
+            
+            // Send 512 bytes of spike data
+            for (byte_idx = 0; byte_idx < 512; byte_idx = byte_idx + 1) begin
+                uart_tx_byte(spike_bytes[byte_idx]);
+            end
+            
+            #5000;  // Allow time for processing
+        end
+    endtask
+    
+    // =========================================================================
+    // Task: Run Complete Inference (T_WINDOW timesteps)
+    // =========================================================================
+    task run_inference;
+        input integer spike_density;  // Percentage of spikes that are 1
+        integer timestep;
+        integer spike_idx, byte_idx, bit_idx;
+        reg [7:0] result_byte;
+        begin
+            $display("\n[TB %0t] ========================================", $time);
+            $display("[TB %0t] Running inference with %0d%% spike density", $time, spike_density);
+            $display("[TB %0t] T_WINDOW = %0d timesteps", $time, T_WINDOW);
+            $display("[TB %0t] ========================================", $time);
+            
+            for (timestep = 0; timestep < T_WINDOW; timestep = timestep + 1) begin
+                // Generate spike pattern
+                for (byte_idx = 0; byte_idx < 512; byte_idx = byte_idx + 1) begin
+                    spike_bytes[byte_idx] = 8'h00;
+                    for (bit_idx = 0; bit_idx < 8; bit_idx = bit_idx + 1) begin
+                        if (($random % 100) < spike_density) begin
+                            spike_bytes[byte_idx][bit_idx] = 1'b1;
+                        end
+                    end
+                end
+                
+                $display("[TB %0t] Sending timestep %0d/%0d", $time, timestep+1, T_WINDOW);
+                send_spike_timestep(512'h0);  // Pattern already in spike_bytes
+            end
+            
+            // Wait for inference to complete
+            $display("[TB %0t] Waiting for inference completion...", $time);
+            wait(done_led == 1'b1);
+            #1000;
+            
+            // Receive result from UART TX
+            uart_rx_byte(result_byte);
+            
+            $display("\n[TB %0t] ========================================", $time);
+            $display("[TB %0t] INFERENCE COMPLETE", $time);
+            $display("[TB %0t] Result: 0x%02h (%s)", $time, result_byte, 
+                     result_byte == 8'h01 ? "COLLISION" : "NO COLLISION");
+            $display("[TB %0t] result_led = %b", $time, result_led);
+            $display("[TB %0t] done_led   = %b", $time, done_led);
+            $display("[TB %0t] ========================================\n", $time);
+        end
+    endtask
+    
+    // =========================================================================
+    // Task: Initialize test weights with specific pattern
+    // =========================================================================
+    task init_weights;
+        input integer pattern_type;  // 0=zeros, 1=ones, 2=random, 3=incremental
+        integer idx;
+        begin
+            case (pattern_type)
+                0: begin  // All zeros
+                    for (idx = 0; idx < N; idx = idx + 1)
+                        test_weights[idx] = 16'sd0;
+                    $display("[TB] Initialized weights: ALL ZEROS");
+                end
+                
+                1: begin  // All ones
+                    for (idx = 0; idx < N; idx = idx + 1)
+                        test_weights[idx] = 16'sd1;
+                    $display("[TB] Initialized weights: ALL ONES");
+                end
+                
+                2: begin  // Random weights (-1000 to +1000)
+                    for (idx = 0; idx < N; idx = idx + 1)
+                        test_weights[idx] = ($random % 2001) - 1000;
+                    $display("[TB] Initialized weights: RANDOM (-1000 to +1000)");
+                end
+                
+                3: begin  // Incremental pattern
+                    for (idx = 0; idx < N; idx = idx + 1)
+                        test_weights[idx] = (idx % 256) - 128;
+                    $display("[TB] Initialized weights: INCREMENTAL (-128 to +127 repeating)");
+                end
+                
+                4: begin  // Half positive, half negative
+                    for (idx = 0; idx < N; idx = idx + 1) begin
+                        if (idx < N/2)
+                            test_weights[idx] = 16'sd100;
+                        else
+                            test_weights[idx] = -16'sd100;
+                    end
+                    $display("[TB] Initialized weights: HALF +100, HALF -100");
+                end
+                
+                default: begin
+                    for (idx = 0; idx < N; idx = idx + 1)
+                        test_weights[idx] = 16'sd0;
+                    $display("[TB] Initialized weights: DEFAULT (ZEROS)");
+                end
+            endcase
+        end
+    endtask
+    
+    // =========================================================================
+    // Main Test Sequence
+    // =========================================================================
+    initial begin
+        // Initialize signals
+        rst_n = 0;
+        rx = 1;  // UART idle state is high
+        error_count = 0;
+        test_num = 0;
+        
+        $display("\n");
+        $display("================================================================================");
+        $display("  SNN ACCELERATOR COMPREHENSIVE TESTBENCH");
+        $display("  Target: 4096 weights, 25 timestep window");
+        $display("  Date: %0t", $time);
+        $display("================================================================================");
+        
+        // Apply reset
+        #100;
+        rst_n = 1;
+        #100;
+        
+        // =====================================================================
+        // TEST 1: Load weights with incremental pattern and run low-density inference
+        // =====================================================================
+        test_num = 1;
+        $display("\n\n");
+        $display("================================================================================");
+        $display("  TEST %0d: Incremental Weights + Low Spike Density (20%%)", test_num);
+        $display("================================================================================");
+        
+        init_weights(3);  // Incremental pattern
+        load_weights();
+        run_inference(20);  // 20% spike density
+        
+        #10000;
+        
+        // =====================================================================
+        // TEST 2: Random weights with high spike density
+        // =====================================================================
+        test_num = 2;
+        $display("\n\n");
+        $display("================================================================================");
+        $display("  TEST %0d: Random Weights + High Spike Density (80%%)", test_num);
+        $display("================================================================================");
+        
+        // Reset system
+        rst_n = 0;
+        #100;
+        rst_n = 1;
+        #100;
+        
+        init_weights(2);  // Random weights
+        load_weights();
+        run_inference(80);  // 80% spike density
+        
+        #10000;
+        
+        // =====================================================================
+        // TEST 3: Mixed positive/negative weights with medium spike density
+        // =====================================================================
+        test_num = 3;
+        $display("\n\n");
+        $display("================================================================================");
+        $display("  TEST %0d: Mixed Weights + Medium Spike Density (50%%)", test_num);
+        $display("================================================================================");
+        
+        // Reset system
+        rst_n = 0;
+        #100;
+        rst_n = 1;
+        #100;
+        
+        init_weights(4);  // Half positive, half negative
+        load_weights();
+        run_inference(50);  // 50% spike density
+        
+        #10000;
+        
+        // =====================================================================
+        // TEST 4: All-ones weights with no spikes (stress test)
+        // =====================================================================
+        test_num = 4;
+        $display("\n\n");
+        $display("================================================================================");
+        $display("  TEST %0d: All-One Weights + No Spikes (0%%)", test_num);
+        $display("================================================================================");
+        
+        // Reset system
+        rst_n = 0;
+        #100;
+        rst_n = 1;
+        #100;
+        
+        init_weights(1);  // All ones
+        load_weights();
+        run_inference(0);  // 0% spike density
+        
+        #10000;
+        
+        // =====================================================================
+        // TEST 5: All-ones weights with all spikes (maximum accumulation)
+        // =====================================================================
+        test_num = 5;
+        $display("\n\n");
+        $display("================================================================================");
+        $display("  TEST %0d: All-One Weights + All Spikes (100%%)", test_num);
+        $display("================================================================================");
+        
+        // Reset system
+        rst_n = 0;
+        #100;
+        rst_n = 1;
+        #100;
+        
+        init_weights(1);  // All ones
+        load_weights();
+        run_inference(100);  // 100% spike density
+        
+        #10000;
+        
+        // =====================================================================
+        // Final Summary
+        // =====================================================================
+        $display("\n\n");
+        $display("================================================================================");
+        $display("  TEST SUMMARY");
+        $display("================================================================================");
+        $display("  Total tests run: %0d", test_num);
+        $display("  Errors found: %0d", error_count);
+        if (error_count == 0) begin
+            $display("  Status: ALL TESTS PASSED!");
+        end else begin
+            $display("  Status: TESTS FAILED - %0d errors", error_count);
+        end
+        $display("================================================================================");
+        $display("\n");
+        
+        #10000;
+        $finish;
+    end
+    
+    // =========================================================================
+    // Monitoring - Track key signals during simulation
+    // =========================================================================
+    initial begin
+        // Optional: Generate VCD file for waveform viewing
+        $dumpfile("tb_snn_top.vcd");
+        $dumpvars(0, tb_snn_top);
+    end
+    
+    // Watchdog timer - prevent infinite simulation
+    initial begin
+        #50000000;  // 50ms timeout
+        $display("\n[TB %0t] ERROR: Simulation timeout!", $time);
+        $finish;
+    end
+
+endmodule
