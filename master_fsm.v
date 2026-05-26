@@ -33,7 +33,7 @@ module master_fsm #(
 
     // Result to UART TX
     output reg [7:0] tx_data,
-    output reg       tx_send,      // Pulse: load tx_data and transmit
+    output reg        tx_send,      // Pulse: load tx_data and transmit
 
     // Status
     output reg inference_done,     // Pulses when a result is ready
@@ -43,15 +43,15 @@ module master_fsm #(
     // -------------------------------------------------------------------------
     // State encoding
     // -------------------------------------------------------------------------
-    localparam S_IDLE         = 4'd0;
-    localparam S_WAIT_WEIGHTS = 4'd1;
-    localparam S_WAIT_SPIKES  = 4'd2;
-    localparam S_STREAM       = 4'd3;
-    localparam S_WAIT_MAC     = 4'd4;
-    localparam S_LIF_STEP     = 4'd5;
-    localparam S_CHECK_WIN    = 4'd6;
-    localparam S_DECIDE       = 4'd7;
-    localparam S_SEND_RESULT  = 4'd8;
+    localparam [3:0] S_IDLE         = 4'd0;
+    localparam [3:0] S_WAIT_WEIGHTS = 4'd1;
+    localparam [3:0] S_WAIT_SPIKES  = 4'd2;
+    localparam [3:0] S_STREAM       = 4'd3;
+    localparam [3:0] S_WAIT_MAC     = 4'd4;
+    localparam [3:0] S_LIF_STEP     = 4'd5;
+    localparam [3:0] S_CHECK_WIN    = 4'd6;
+    localparam [3:0] S_DECIDE       = 4'd7;
+    localparam [3:0] S_SEND_RESULT  = 4'd8;
 
     reg [3:0] state;
 
@@ -63,30 +63,37 @@ module master_fsm #(
     reg [5:0]  lif_spike_accum; // LIF spikes accumulated across T_WINDOW
 
     // -------------------------------------------------------------------------
+    // Sized Parametric Derivatives (Prevents 32-bit expansion)
+    // -------------------------------------------------------------------------
+    localparam [12:0] MAX_SPIKES_INDEX = N[12:0] - 13'd1;
+    localparam [4:0]  MAX_WINDOW_STEPS = T_WINDOW[4:0];
+    localparam [5:0]  SPIKE_THRESHOLD  = T_WINDOW[5:0] >> 1;
+
+    // -------------------------------------------------------------------------
     // State register
     // -------------------------------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n) begin
-            state            <= S_IDLE;
-            adder_start      <= 0;
-            lif_current_valid<= 0;
-            sc_start         <= 0;
-            sc_spike_valid   <= 0;
-            tx_send          <= 0;
-            inference_done   <= 0;
-            class_out        <= 0;
-            tx_data          <= 0;
-            spike_count      <= 0;
-            timestep_count   <= 0;
-            lif_spike_accum  <= 0;
+            state             <= S_IDLE;
+            adder_start       <= 1'b0;
+            lif_current_valid <= 1'b0;
+            sc_start          <= 1'b0;
+            sc_spike_valid    <= 1'b0;
+            tx_send           <= 1'b0;
+            inference_done    <= 1'b0;
+            class_out         <= 1'b0;
+            tx_data           <= 8'd0;
+            spike_count       <= 13'd0;
+            timestep_count    <= 5'd0;
+            lif_spike_accum   <= 6'd0;
         end else begin
             // Pulse signals: clear every cycle by default
-            adder_start       <= 0;
-            lif_current_valid <= 0;
-            sc_start          <= 0;
-            sc_spike_valid    <= 0;
-            tx_send           <= 0;
-            inference_done    <= 0;
+            adder_start       <= 1'b0;
+            lif_current_valid <= 1'b0;
+            sc_start          <= 1'b0;
+            sc_spike_valid    <= 1'b0;
+            tx_send           <= 1'b0;
+            inference_done    <= 1'b0;
 
             case (state)
                 // ---- Wait until weights are in BRAM -------------------------
@@ -94,27 +101,27 @@ module master_fsm #(
                     if (!weights_loaded)
                         state <= S_WAIT_WEIGHTS;
                     else begin
-                        timestep_count  <= 0;
-                        lif_spike_accum <= 0;
-                        sc_start        <= 1;  // Initialise spike_counter window
+                        timestep_count  <= 5'd0;
+                        lif_spike_accum <= 6'd0;
+                        sc_start        <= 1'b1;  // Initialize spike_counter window
                         state           <= S_WAIT_SPIKES;
                     end
                 end
 
                 S_WAIT_WEIGHTS: begin
                     if (weights_loaded) begin
-                        timestep_count  <= 0;
-                        lif_spike_accum <= 0;
-                        sc_start        <= 1;
+                        timestep_count  <= 5'd0;
+                        lif_spike_accum <= 6'd0;
+                        sc_start        <= 1'b1;
                         state           <= S_WAIT_SPIKES;
                     end
                 end
 
                 // ---- Wait for spike FIFO to have data -----------------------
                 S_WAIT_SPIKES: begin
-                    spike_count <= 0;
+                    spike_count <= 13'd0;
                     if (!fifo_empty) begin
-                        adder_start <= 1;   // Prime the cascaded_adder
+                        adder_start <= 1'b1;   // Prime the cascaded_adder
                         state       <= S_STREAM;
                     end
                 end
@@ -122,8 +129,8 @@ module master_fsm #(
                 // ---- Stream N spikes to cascaded_adder ----------------------
                 S_STREAM: begin
                     if (spike_valid_in) begin
-                        spike_count <= spike_count + 1;
-                        if (spike_count == N - 1)
+                        spike_count <= spike_count + 13'd1;
+                        if (spike_count == MAX_SPIKES_INDEX)
                             state <= S_WAIT_MAC;
                     end
                 end
@@ -131,24 +138,24 @@ module master_fsm #(
                 // ---- Wait for MAC result ------------------------------------
                 S_WAIT_MAC: begin
                     if (adder_valid) begin
-                        lif_current_valid <= 1;  // Present result to LIF
+                        lif_current_valid <= 1'b1;  // Present result to LIF
                         state             <= S_LIF_STEP;
                     end
                 end
 
                 // ---- LIF processes the MAC result for one timestep ----------
                 S_LIF_STEP: begin
-                    // LIF output is registered: spike_out is valid next cycle
-                    sc_spike_valid  <= 1;          // Tell spike_counter to sample
+                    sc_spike_valid <= 1'b1;          // Tell spike_counter to sample
                     if (lif_spike_out)
-                        lif_spike_accum <= lif_spike_accum + 1;
-                    timestep_count <= timestep_count + 1;
+                        lif_spike_accum <= lif_spike_accum + 6'd1;
+                    
+                    timestep_count <= timestep_count + 5'd1;
                     state          <= S_CHECK_WIN;
                 end
 
                 // ---- Decide whether to do another timestep ------------------
                 S_CHECK_WIN: begin
-                    if (timestep_count < T_WINDOW)
+                    if (timestep_count < MAX_WINDOW_STEPS)
                         state <= S_WAIT_SPIKES;   // More timesteps: get next chunk
                     else
                         state <= S_DECIDE;
@@ -156,21 +163,19 @@ module master_fsm #(
 
                 // ---- Rate-decode and produce classification ------------------
                 S_DECIDE: begin
-                    class_out      <= (lif_spike_accum > (T_WINDOW >> 1))
-                                      ? 1'b1 : 1'b0;
-                    inference_done <= 1;
-                    tx_data        <= (lif_spike_accum > (T_WINDOW >> 1))
-                                      ? 8'h01 : 8'h00;
+                    class_out      <= (lif_spike_accum > SPIKE_THRESHOLD) ? 1'b1 : 1'b0;
+                    inference_done <= 1'b1;
+                    tx_data        <= (lif_spike_accum > SPIKE_THRESHOLD) ? 8'h01 : 8'h00;
                     state          <= S_SEND_RESULT;
                 end
 
                 // ---- Send result byte to PC via UART ------------------------
                 S_SEND_RESULT: begin
-                    tx_send        <= 1;
+                    tx_send         <= 1'b1;
                     // Reset for next frame
-                    timestep_count  <= 0;
-                    lif_spike_accum <= 0;
-                    sc_start        <= 1;
+                    timestep_count  <= 5'd0;
+                    lif_spike_accum <= 6'd0;
+                    sc_start        <= 1'b1;
                     state           <= S_WAIT_SPIKES;
                 end
 
