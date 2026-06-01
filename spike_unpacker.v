@@ -25,11 +25,12 @@ module spike_unpacker (
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            state       <= IDLE;
-            fifo_rd_en  <= 0;
-            spike_valid <= 0;
-            spike_out   <= 0;
-            bit_counter <= 0;
+            state        <= IDLE;
+            fifo_rd_en   <= 0;
+            spike_valid  <= 0;
+            spike_out    <= 0;
+            bit_counter  <= 0;
+            current_byte <= 8'd0;
         end else begin
             fifo_rd_en  <= 0;
             spike_valid <= 0;
@@ -50,7 +51,7 @@ module spike_unpacker (
                 end
 
                 SHIFT_BITS: begin
-                    spike_out   <= current_byte[bit_counter];  // Output LSB-first
+                    spike_out   <= current_byte[3'd7 - bit_counter];  // Output MSB-first
                     spike_valid <= 1;
 
                     if (bit_counter == 3'd7) begin
