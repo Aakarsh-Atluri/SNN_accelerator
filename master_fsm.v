@@ -52,6 +52,7 @@ module master_fsm #(
     localparam [3:0] S_CHECK_WIN    = 4'd6;
     localparam [3:0] S_DECIDE       = 4'd7;
     localparam [3:0] S_SEND_RESULT  = 4'd8;
+    localparam [3:0] S_LIF_WAIT     = 4'd9;
 
     reg [3:0] state;
 
@@ -139,8 +140,13 @@ module master_fsm #(
                 S_WAIT_MAC: begin
                     if (adder_valid) begin
                         lif_current_valid <= 1'b1;  // Present result to LIF
-                        state             <= S_LIF_STEP;
+                        state             <= S_LIF_WAIT;
                     end
+                end
+
+                // ---- Wait 1 cycle for LIF to register its output -----------
+                S_LIF_WAIT: begin
+                    state <= S_LIF_STEP;
                 end
 
                 // ---- LIF processes the MAC result for one timestep ----------

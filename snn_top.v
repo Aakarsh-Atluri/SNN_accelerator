@@ -48,7 +48,7 @@ module snn_top (
     wire        bram_wr_en_w;
 
     // master_fsm → weight_bram (read)
-    wire [12:0] adder_weight_addr;  // from cascaded_adder
+    wire [11:0] adder_weight_addr;  // from cascaded_adder
     wire [15:0] bram_dout;          // to cascaded_adder
 
     // fifo_uart_controller → master_fsm
@@ -70,7 +70,7 @@ module snn_top (
 
     // lif_neuron → master_fsm
     wire lif_spike_out;
-	wire lif_spike_valid
+	wire lif_spike_valid;
 	
     // master_fsm → spike_counter
     wire sc_start;
@@ -124,7 +124,7 @@ module snn_top (
         .din_a  (bram_din_w),
         // Read port (from cascaded_adder during inference)
         .clk_b  (clk),
-        .addr_b (adder_weight_addr[11:0]),
+        .addr_b (adder_weight_addr),
         .dout_b (bram_dout)
     );
 
@@ -148,7 +148,7 @@ module snn_top (
         .OUT(OUT)
     ) u_mac (
         .clk         (clk),
-        .rst       (rst_n),
+        .rst       (~rst_n),
         .start       (adder_start),
         .spike_in    (spike_bit),
         .spike_valid (spike_valid),
