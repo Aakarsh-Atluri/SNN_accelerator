@@ -1,0 +1,26 @@
+# Vivado logs and journals
+*.log
+*.jou
+*.pb
+*.wdb
+*.str
+*.vcd
+.Xil/
+xsim.dir/
+
+# Simulation directory artifacts
+sim/xsim.dir/
+sim/*.log
+sim/*.jou
+sim/*.pb
+sim/*.wdb
+sim/*.vcd
+
+# C Host binaries and objects
+host/*.o
+host/snn_inference_eth
+host/generate_dummy_data
+
+# Results
+batch_results.csv
+results.csv
