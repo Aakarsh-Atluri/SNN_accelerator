@@ -1,4 +1,15 @@
 `timescale 1ns / 1ps
+// =============================================================================
+// Module: fifo_uart_controller
+// Description: UART RX/TX controller with Spike FIFO and BRAM Weight Loader.
+//              Handles:
+//                1. Receiving 8192 bytes of weights (0xAA header) into BRAM,
+//                   then acknowledging with 0x01 ACK and returning to IDLE.
+//                2. Receiving 0xBB command, acknowledging with 0x01 ACK, and
+//                   streaming 25 timesteps of 512 bytes into FIFO with per-block ACKs.
+//                3. Transmitting classification result byte from Master FSM.
+//                4. Automatically returning to IDLE after 25 timesteps.
+// =============================================================================
 module fifo_uart_controller #(
     parameter CLK_FREQ   = 100_000_000, // System clock (Hz)
     parameter BAUD_RATE  = 115200,
@@ -21,33 +32,43 @@ module fifo_uart_controller #(
     output reg  [15:0] bram_din,   // Two bytes assembled into one 16-bit word
     output reg         bram_wr_en,
 
+    // Interface from Master FSM for UART TX
+    input  wire       tx_send_fsm,
+    input  wire [7:0] tx_data_fsm,
+    output wire       tx_busy,
+
     // Status
     output reg         weights_loaded  // Stays high after all weights received
 );
 
     // -------------------------------------------------------------------------
-    // 1. BAUD RATE GENERATOR (Sized explicitly to 16-bit vectors)
+    // 1. BAUD RATE PARAMETERS
     // -------------------------------------------------------------------------
-    localparam [15:0] BAUD_DIV  = CLK_FREQ / BAUD_RATE;        // ~868
-    localparam [15:0] BAUD_HALF = (CLK_FREQ / BAUD_RATE) / 2;  // ~434
+    localparam [15:0] BAUD_DIV  = CLK_FREQ / BAUD_RATE;        // 100MHz / 115200 = 868
+    localparam [15:0] BAUD_HALF = (CLK_FREQ / BAUD_RATE) / 2;  // 434
 
-    reg [15:0] baud_cnt;
-    wire baud_tick = (baud_cnt == (BAUD_DIV - 16'd1));
+    // -------------------------------------------------------------------------
+    // 2. UART RX - 8N1 with 2-Stage Input Synchronizer
+    // -------------------------------------------------------------------------
+    reg rx_sync0;
+    reg rx_sync1;
 
     always @(posedge clk) begin
-        if (!rst_n || baud_tick) baud_cnt <= 16'd0;
-        else                     baud_cnt <= baud_cnt + 16'd1;
+        if (!rst_n) begin
+            rx_sync0 <= 1'b1;
+            rx_sync1 <= 1'b1;
+        end else begin
+            rx_sync0 <= rx;
+            rx_sync1 <= rx_sync0;
+        end
     end
 
-    // -------------------------------------------------------------------------
-    // 2. UART RX - 8N1 (Sized case statements and ticks)
-    // -------------------------------------------------------------------------
     reg [3:0]  rx_state;
     reg [7:0]  rx_shift;
     reg        rx_valid;
     reg [7:0]  rx_data;
-    
     reg [15:0] rx_baud_cnt;
+
     wire rx_mid_tick  = (rx_baud_cnt == (BAUD_HALF - 16'd1));
     wire rx_full_tick = (rx_baud_cnt == (BAUD_DIV - 16'd1));
 
@@ -55,13 +76,15 @@ module fifo_uart_controller #(
         if (!rst_n) begin
             rx_state    <= 4'd0;
             rx_valid    <= 1'b0;
+            rx_data     <= 8'd0;
+            rx_shift    <= 8'd0;
             rx_baud_cnt <= 16'd0;
         end else begin
             rx_valid <= 1'b0;
 
             case (rx_state)
-                4'd0: begin // IDLE: watch for start bit
-                    if (rx == 1'b0) begin
+                4'd0: begin // IDLE: watch for start bit falling edge
+                    if (rx_sync1 == 1'b0) begin
                         rx_state    <= 4'd1;
                         rx_baud_cnt <= 16'd0;
                     end
@@ -69,25 +92,37 @@ module fifo_uart_controller #(
 
                 4'd1: begin // Wait for mid-point of start bit
                     if (rx_mid_tick) begin
-                        rx_baud_cnt <= 16'd0;
-                        rx_state    <= 4'd2;
-                    end else rx_baud_cnt <= rx_baud_cnt + 16'd1;
+                        if (rx_sync1 == 1'b0) begin // Valid start bit confirmed
+                            rx_baud_cnt <= 16'd0;
+                            rx_state    <= 4'd2;
+                        end else begin
+                            rx_state    <= 4'd0; // False start glitch
+                        end
+                    end else begin
+                        rx_baud_cnt <= rx_baud_cnt + 16'd1;
+                    end
                 end
 
-                4'd2, 4'd3, 4'd4, 4'd5, 4'd6, 4'd7, 4'd8, 4'd9: begin // 8 data bits
+                4'd2, 4'd3, 4'd4, 4'd5, 4'd6, 4'd7, 4'd8, 4'd9: begin // 8 data bits (LSB first)
                     if (rx_full_tick) begin
-                        rx_shift    <= {rx, rx_shift[7:1]}; // LSB first
+                        rx_shift    <= {rx_sync1, rx_shift[7:1]};
                         rx_baud_cnt <= 16'd0;
                         rx_state    <= rx_state + 4'd1;
-                    end else rx_baud_cnt <= rx_baud_cnt + 16'd1;
+                    end else begin
+                        rx_baud_cnt <= rx_baud_cnt + 16'd1;
+                    end
                 end
 
                 4'd10: begin // Stop bit
                     if (rx_full_tick) begin
-                        rx_data  <= rx_shift;
-                        rx_valid <= 1'b1;
+                        if (rx_sync1 == 1'b1) begin // Valid stop bit
+                            rx_data  <= rx_shift;
+                            rx_valid <= 1'b1;
+                        end
                         rx_state <= 4'd0;
-                    end else rx_baud_cnt <= rx_baud_cnt + 16'd1;
+                    end else begin
+                        rx_baud_cnt <= rx_baud_cnt + 16'd1;
+                    end
                 end
 
                 default: rx_state <= 4'd0;
@@ -96,34 +131,49 @@ module fifo_uart_controller #(
     end
 
     // -------------------------------------------------------------------------
-    // 3. UART TX - sends ACK byte (Sized constants and comparisons)
+    // 3. UART TX ENGINE (Handles both ACK bytes and FSM results)
     // -------------------------------------------------------------------------
-    reg [9:0]  tx_shift;   // {stop, data[7:0], start}
+    reg [9:0]  tx_shift;   // {stop(1), data[7:0], start(0)}
     reg [3:0]  tx_state;
     reg        tx_active;
-    reg        tx_start_pulse;
+    reg [15:0] tx_baud_cnt;
 
-    assign tx = tx_active ? tx_shift[0] : 1'b1;
+    reg        tx_start_req;
+    reg [7:0]  tx_byte_in;
+
+    assign tx      = tx_active ? tx_shift[0] : 1'b1;
+    assign tx_busy = tx_active || tx_start_req;
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            tx_state  <= 4'd0;
-            tx_active <= 1'b0;
+            tx_state    <= 4'd0;
+            tx_active   <= 1'b0;
+            tx_shift    <= 10'h3FF;
+            tx_baud_cnt <= 16'd0;
         end else begin
-            if (tx_start_pulse && !tx_active) begin
-                tx_shift  <= {1'b1, 8'h01, 1'b0};  // Stop + ACK(0x01) + Start
-                tx_active <= 1'b1;
-                tx_state  <= 4'd0;
-            end else if (tx_active && baud_tick) begin
-                tx_shift <= {1'b1, tx_shift[9:1]};  // Shift out LSB first
-                if (tx_state == 4'd9) tx_active <= 1'b0;
-                else                  tx_state  <= tx_state + 4'd1;
+            if (tx_start_req && !tx_active) begin
+                tx_shift    <= {1'b1, tx_byte_in, 1'b0};  // Stop(1) + Data(8) + Start(0)
+                tx_active   <= 1'b1;
+                tx_state    <= 4'd0;
+                tx_baud_cnt <= 16'd0;                     // Reset baud counter for full start bit
+            end else if (tx_active) begin
+                if (tx_baud_cnt == (BAUD_DIV - 16'd1)) begin
+                    tx_baud_cnt <= 16'd0;
+                    tx_shift    <= {1'b1, tx_shift[9:1]};  // Shift out LSB first
+                    if (tx_state == 4'd9) begin
+                        tx_active <= 1'b0;
+                    end else begin
+                        tx_state  <= tx_state + 4'd1;
+                    end
+                end else begin
+                    tx_baud_cnt <= tx_baud_cnt + 16'd1;
+                end
             end
         end
     end
 
     // -------------------------------------------------------------------------
-    // 4. SPIKE FIFO (Sized pointers)
+    // 4. SPIKE FIFO (Distributed RAM / LUTRAM)
     // -------------------------------------------------------------------------
     localparam FIFO_BITS = 10;  // log2(1024)
 
@@ -154,7 +204,7 @@ module fifo_uart_controller #(
     end
 
     // -------------------------------------------------------------------------
-    // 5. WEIGHT BYTE ASSEMBLER (Sized to a 14-bit localparam matched to counter)
+    // 5. WEIGHT BYTE ASSEMBLER & CONTROLLER FSM
     // -------------------------------------------------------------------------
     reg [7:0]  weight_hi;
     reg        weight_hi_valid;
@@ -162,40 +212,70 @@ module fifo_uart_controller #(
     localparam [13:0] WEIGHT_BYTES = 14'd8192; // 4096 weights * 2 bytes
     reg [13:0] weight_byte_cnt;
 
-    // -------------------------------------------------------------------------
-    // 6. CONTROLLER FSM (Sized state indicators and math operations)
-    // -------------------------------------------------------------------------
-    localparam [2:0] IDLE_ST      = 3'd0;
-    localparam [2:0] RCV_WEIGHTS  = 3'd1;
-    localparam [2:0] SEND_ACK     = 3'd2;
-    localparam [2:0] RCV_SPIKES   = 3'd3;
+    localparam [2:0] IDLE_ST              = 3'd0;
+    localparam [2:0] RCV_WEIGHTS          = 3'd1;
+    localparam [2:0] SEND_ACK_THEN_IDLE   = 3'd2;
+    localparam [2:0] SEND_ACK_THEN_SPIKES = 3'd3;
+    localparam [2:0] RCV_SPIKES           = 3'd4;
 
     reg [2:0]  ctrl_state;
     reg [9:0]  spike_byte_cnt;
+    reg [4:0]  timestep_cnt;
+
+    // Buffer for FSM result TX if TX is currently busy
+    reg        fsm_tx_pending;
+    reg [7:0]  fsm_tx_data_latched;
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            ctrl_state      <= IDLE_ST;
-            fifo_wr_en_int  <= 1'b0;
-            bram_wr_en      <= 1'b0;
-            bram_addr       <= 12'd0;
-            bram_din        <= 16'd0;
-            tx_start_pulse  <= 1'b0;
-            spike_byte_cnt  <= 10'd0;
-            weight_byte_cnt <= 14'd0;
-            weight_hi_valid <= 1'b0;
-            weight_hi       <= 8'd0;
-            weights_loaded  <= 1'b0;
+            ctrl_state          <= IDLE_ST;
+            fifo_wr_en_int      <= 1'b0;
+            fifo_din_int        <= 8'd0;
+            bram_wr_en          <= 1'b0;
+            bram_addr           <= 12'd0;
+            bram_din            <= 16'd0;
+            spike_byte_cnt      <= 10'd0;
+            timestep_cnt        <= 5'd0;
+            weight_byte_cnt     <= 14'd0;
+            weight_hi_valid     <= 1'b0;
+            weight_hi           <= 8'd0;
+            weights_loaded      <= 1'b0;
+            tx_start_req        <= 1'b0;
+            tx_byte_in          <= 8'd0;
+            fsm_tx_pending      <= 1'b0;
+            fsm_tx_data_latched <= 8'd0;
         end else begin
             fifo_wr_en_int <= 1'b0;
             bram_wr_en     <= 1'b0;
-            tx_start_pulse <= 1'b0;
+            tx_start_req   <= 1'b0;
+
+            // Latch FSM TX request if it arrives
+            if (tx_send_fsm) begin
+                fsm_tx_pending      <= 1'b1;
+                fsm_tx_data_latched <= tx_data_fsm;
+            end
 
             case (ctrl_state)
                 IDLE_ST: begin
+                    // Priority 1: Service pending FSM result TX
+                    if (fsm_tx_pending && !tx_active && !tx_start_req) begin
+                        tx_byte_in     <= fsm_tx_data_latched;
+                        tx_start_req   <= 1'b1;
+                        fsm_tx_pending <= 1'b0;
+                    end
+
+                    // Priority 2: UART RX commands
                     if (rx_valid) begin
-                        if      (rx_data == 8'hAA) ctrl_state <= RCV_WEIGHTS;
-                        else if (rx_data == 8'hBB) ctrl_state <= SEND_ACK;
+                        if (rx_data == 8'hAA) begin
+                            ctrl_state      <= RCV_WEIGHTS;
+                            weight_byte_cnt <= 14'd0;
+                            weight_hi_valid <= 1'b0;
+                            bram_addr       <= 12'd0;
+                            weights_loaded  <= 1'b0;
+                        end else if (rx_data == 8'hBB) begin
+                            timestep_cnt    <= 5'd0;
+                            ctrl_state      <= SEND_ACK_THEN_SPIKES;
+                        end
                     end
                 end
 
@@ -210,31 +290,53 @@ module fifo_uart_controller #(
                             bram_addr       <= bram_addr + 12'd1;
                             weight_hi_valid <= 1'b0;
                             weight_byte_cnt <= weight_byte_cnt + 14'd2;
-                        end
-                    end
 
-                    if (weight_byte_cnt >= WEIGHT_BYTES) begin
-                        weights_loaded <= 1'b1;
-                        ctrl_state     <= IDLE_ST;
+                            if (weight_byte_cnt + 14'd2 == WEIGHT_BYTES) begin
+                                weights_loaded <= 1'b1;
+                                ctrl_state     <= SEND_ACK_THEN_IDLE; // ACK weights and return to IDLE
+                            end
+                        end
                     end
                 end
 
-                SEND_ACK: begin
-                    if (!tx_active) begin
-                        tx_start_pulse <= 1'b1;
+                SEND_ACK_THEN_IDLE: begin
+                    if (!tx_active && !tx_start_req) begin
+                        tx_byte_in   <= 8'h01; // SNN_RESP_ACK
+                        tx_start_req <= 1'b1;
+                        ctrl_state   <= IDLE_ST;
+                    end
+                end
+
+                SEND_ACK_THEN_SPIKES: begin
+                    if (!tx_active && !tx_start_req) begin
+                        tx_byte_in     <= 8'h01; // SNN_RESP_ACK
+                        tx_start_req   <= 1'b1;
                         ctrl_state     <= RCV_SPIKES;
                         spike_byte_cnt <= 10'd0;
                     end
                 end
 
                 RCV_SPIKES: begin
+                    // If FSM finished and wants to send classification result while in RCV_SPIKES
+                    if (fsm_tx_pending && !tx_active && !tx_start_req) begin
+                        tx_byte_in     <= fsm_tx_data_latched;
+                        tx_start_req   <= 1'b1;
+                        fsm_tx_pending <= 1'b0;
+                    end
+
                     if (rx_valid) begin
                         fifo_din_int   <= rx_data;
                         fifo_wr_en_int <= 1'b1;
                         spike_byte_cnt <= spike_byte_cnt + 10'd1;
 
                         if (spike_byte_cnt == 10'd511) begin
-                            ctrl_state <= SEND_ACK;
+                            if (timestep_cnt == 5'd24) begin
+                                timestep_cnt <= 5'd0;
+                                ctrl_state   <= SEND_ACK_THEN_IDLE; // Final timestep ACK & return to IDLE
+                            end else begin
+                                timestep_cnt <= timestep_cnt + 5'd1;
+                                ctrl_state   <= SEND_ACK_THEN_SPIKES;
+                            end
                         end
                     end
                 end

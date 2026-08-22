@@ -2,9 +2,10 @@
 
 module tb_cascaded_adder;
 
-    parameter N   = 4;
-    parameter W   = 16;
-    parameter OUT = 32;
+    parameter N      = 4;
+    parameter W      = 16;
+    parameter OUT    = 32;
+    parameter ADDR_W = 2;
 
     reg clk;
     reg rst;
@@ -14,7 +15,7 @@ module tb_cascaded_adder;
     reg spike_in;
     reg spike_valid;
 
-    wire [$clog2(N)-1:0] weight_addr;
+    wire [ADDR_W-1:0] weight_addr;
     reg signed [W-1:0] weight_data;
 
     reg signed [W-1:0] bias;
@@ -31,27 +32,22 @@ module tb_cascaded_adder;
     // ============================================================
 
     cascaded_adder #(
-        .N(N),
-        .W(W),
-        .OUT(OUT)
+        .N     (N),
+        .W     (W),
+        .OUT   (OUT),
+        .ADDR_W(ADDR_W)
     ) dut (
-        .clk(clk),
-        .rst(rst),
-
-        .start(start),
-
-        .busy(busy),
-        .valid(valid),
-
-        .spike_in(spike_in),
+        .clk        (clk),
+        .rst        (rst),
+        .start      (start),
+        .busy       (busy),
+        .valid      (valid),
+        .spike_in   (spike_in),
         .spike_valid(spike_valid),
-
         .weight_addr(weight_addr),
         .weight_data(weight_data),
-
-        .bias(bias),
-
-        .result(result)
+        .bias       (bias),
+        .result     (result)
     );
 
     // ============================================================
@@ -61,15 +57,12 @@ module tb_cascaded_adder;
     always #5 clk = ~clk;
 
     // ============================================================
-    // BRAM MODEL
-    // IMPORTANT:
-    // combinational output
-    // DUT already models pipeline timing
+    // BRAM MODEL (Synchronous 1-cycle latency matching weight_bram)
     // ============================================================
 
     reg signed [W-1:0] mem [0:N-1];
 
-    always @(*) begin
+    always @(posedge clk) begin
         weight_data <= mem[weight_addr];
     end
 
@@ -78,7 +71,6 @@ module tb_cascaded_adder;
     // ============================================================
 
     always @(posedge clk) begin
-
         $display(
             "[TB] time=%0t | addr=%0d | weight=%0d | spike=%0d | valid=%0d | result=%0d",
             $time,
@@ -109,11 +101,11 @@ module tb_cascaded_adder;
         expected = 8;
 
         // weights = [1,2,3,4]
-
         mem[0] = 1;
         mem[1] = 2;
         mem[2] = 3;
         mem[3] = 4;
+        weight_data = 0;
 
         // reset
         #20;

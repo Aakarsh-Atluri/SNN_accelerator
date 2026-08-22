@@ -1,26 +1,27 @@
 `timescale 1ns / 1ps
 // =============================================================================
 // Module: snn_top
-// Description: Top-level integration of the SNN inference engine.
+// Description: Top-level integration of the SNN inference engine accelerator.
 //              Instantiates all submodules and connects them.
 //
-// Target: Xilinx Artix-7 (xc7a35t or larger)
-// Clock:  100 MHz system clock (add clocking wizard if using oscillator)
+// Target Board: Digilent Arty A7-100T (xc7a100tcsg324-1)
+// Clock:        100 MHz onboard oscillator (Pin E3)
 //
-// Pin Connections (example for Basys3 / Nexys A7):
-//   clk   → W5  (100 MHz oscillator)
-//   rst_n → T1  (BTN_CENTER, active LOW via inversion in XDC)
-//   rx    → B18 (USB-UART RX from FTDI chip)
-//   tx    → A18 (USB-UART TX to   FTDI chip)
-//   result_led → LED[0]
+// Pin Connections for Digilent Arty A7-100T:
+//   clk        → Pin E3  (100 MHz oscillator, IOSTANDARD LVCMOS33)
+//   rst_n      → Pin C2  (RESET pushbutton / CPU_RESETN, active-LOW)
+//   rx         → Pin A9  (UART_TXD_IN / USB-UART RX from FT2232)
+//   tx         → Pin D10 (UART_RXD_OUT / USB-UART TX to FT2232)
+//   result_led → Pin H5  (LED 0, green: 1 = collision detected)
+//   done_led   → Pin J5  (LED 1, green: 1 = inference completed)
 // =============================================================================
 module snn_top (
-    input  wire clk,       // 100 MHz
-    input  wire rst_n,     // Active-low reset (button)
-    input  wire rx,        // UART receive
-    output wire tx,        // UART transmit
-    output wire result_led, // LED: 1 = collision detected
-    output wire done_led    // LED: inference complete
+    input  wire clk,        // 100 MHz system clock
+    input  wire rst_n,      // Active-low reset (Arty A7 RESET button / CPU_RESETN)
+    input  wire rx,         // UART receive (FPGA input from PC)
+    output wire tx,         // UART transmit (FPGA output to PC)
+    output wire result_led, // LED 0: 1 = collision detected
+    output wire done_led    // LED 1: 1 = inference complete
 );
 
     // -------------------------------------------------------------------------
@@ -32,6 +33,25 @@ module snn_top (
     localparam T_WINDOW  = 25;
     localparam CLK_FREQ  = 100_000_000;
     localparam BAUD_RATE = 115200;
+
+    // -------------------------------------------------------------------------
+    // Synchronize active-low reset to clock domain
+    // -------------------------------------------------------------------------
+    reg rst_n_sync0;
+    reg rst_n_sync1;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rst_n_sync0 <= 1'b0;
+            rst_n_sync1 <= 1'b0;
+        end else begin
+            rst_n_sync0 <= 1'b1;
+            rst_n_sync1 <= rst_n_sync0;
+        end
+    end
+
+    wire sys_rst_n = rst_n_sync1;
+    wire sys_rst   = ~sys_rst_n;
 
     // =========================================================================
     // Internal wire declarations
@@ -70,8 +90,8 @@ module snn_top (
 
     // lif_neuron → master_fsm
     wire lif_spike_out;
-	wire lif_spike_valid;
-	
+    wire lif_spike_valid;
+
     // master_fsm → spike_counter
     wire sc_start;
     wire sc_spike_valid;
@@ -80,7 +100,7 @@ module snn_top (
     wire sc_done;
     wire sc_result;
 
-    // master_fsm → UART TX
+    // master_fsm → UART TX (via fifo_uart_controller)
     wire [7:0] tx_data;
     wire       tx_send;
 
@@ -99,15 +119,18 @@ module snn_top (
         .FIFO_DEPTH(1024)
     ) u_fifo_uart (
         .clk           (clk),
-        .rst_n         (rst_n),
+        .rst_n         (sys_rst_n),
         .rx            (rx),
-        .tx            (tx),          // Weight-loading & ACK TX handled here
+        .tx            (tx),
         .fifo_rd_en    (fifo_rd_en),
         .fifo_dout     (fifo_dout),
         .fifo_empty    (fifo_empty),
         .bram_addr     (bram_addr_w),
         .bram_din      (bram_din_w),
         .bram_wr_en    (bram_wr_en_w),
+        .tx_send_fsm   (tx_send),
+        .tx_data_fsm   (tx_data),
+        .tx_busy       (),
         .weights_loaded(weights_loaded)
     );
 
@@ -131,7 +154,7 @@ module snn_top (
     // ---- 3. Spike Unpacker ---------------------------------------------------
     spike_unpacker u_unpacker (
         .clk        (clk),
-        .rst_n      (rst_n),
+        .rst_n      (sys_rst_n),
         .fifo_empty (fifo_empty),
         .fifo_dout  (fifo_dout),
         .fifo_rd_en (fifo_rd_en),
@@ -140,39 +163,39 @@ module snn_top (
     );
 
     // ---- 4. Cascaded Adder (MAC) --------------------------------------------
-    // Note: bias = 0 for simplicity; replace with a register file if
-    //       you have per-neuron biases loaded separately.
     cascaded_adder #(
-        .N  (N),
-        .W  (W),
-        .OUT(OUT)
+        .N     (N),
+        .W     (W),
+        .OUT   (OUT),
+        .ADDR_W(12)
     ) u_mac (
         .clk         (clk),
-        .rst       (~rst_n),
+        .rst         (sys_rst),
         .start       (adder_start),
+        .busy        (),
         .spike_in    (spike_bit),
         .spike_valid (spike_valid),
         .weight_addr (adder_weight_addr),
         .weight_data (bram_dout),
-        .bias        (16'sd0),        // Tie to 0 or add bias BRAM
+        .bias        (16'sd0),        // Zero bias
         .result      (adder_result),
         .valid       (adder_valid)
     );
 
     // ---- 5. LIF Neuron -------------------------------------------------------
     lif_neuron #(
+        .WIDTH     (32),
         .THRESHOLD (32'sd1000),
         .LEAK_SHIFT(3),
-        .RESET_VAL(0),
-		  .WIDTH(32)
+        .RESET_VAL (0)
     ) u_lif (
         .clk           (clk),
-        .rst         (~rst_n),
-        .current_in    (adder_result[31:0]),   // Take lower 16 bits of 28-bit result
+        .rst           (sys_rst),
+        .current_in    (adder_result[31:0]),
         .current_valid (lif_current_valid),
         .spike_out     (lif_spike_out),
-		  .spike_valid   (lif_spike_valid),
-		  .membrane_out  ()
+        .spike_valid   (lif_spike_valid),
+        .membrane_out  ()
     );
 
     // ---- 6. Spike Counter (Rate Decoder) -------------------------------------
@@ -180,11 +203,11 @@ module snn_top (
         .T_WINDOW(T_WINDOW)
     ) u_sc (
         .clk         (clk),
-        .rst_n       (rst_n),
+        .rst_n       (sys_rst_n),
         .start       (sc_start),
         .spike_in    (lif_spike_out),
         .spike_valid (sc_spike_valid),
-        .count_1     (),               // Unused outputs left open
+        .count_1     (),
         .count_0     (),
         .result      (sc_result),
         .done        (sc_done)
@@ -196,7 +219,7 @@ module snn_top (
         .T_WINDOW(T_WINDOW)
     ) u_fsm (
         .clk              (clk),
-        .rst_n            (rst_n),
+        .rst_n            (sys_rst_n),
         .fifo_empty       (fifo_empty),
         .weights_loaded   (weights_loaded),
         .spike_valid_in   (spike_valid),
@@ -215,8 +238,17 @@ module snn_top (
         .class_out        (class_out)
     );
 
-    // ---- 8. Status LEDs ------------------------------------------------------
+    // ---- 8. Status LEDs with Latch for Clear Visibility ----------------------
+    reg done_latched;
+    always @(posedge clk) begin
+        if (!sys_rst_n) begin
+            done_latched <= 1'b0;
+        end else if (inference_done) begin
+            done_latched <= 1'b1;
+        end
+    end
+
     assign result_led = class_out;
-    assign done_led   = inference_done;
+    assign done_led   = done_latched;
 
 endmodule
