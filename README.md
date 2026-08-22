@@ -32,7 +32,6 @@ SNN_accelerator_eth/
 ├── scripts/                    # Vivado Automation Scripts
 │   ├── build_bitstream.tcl     # Synthesis, implementation & bitstream flow
 │   └── program_fpga.tcl        # Hardware Manager flashing script
-├── data/                       # Sample datasets, weights & test vectors
 └── build/                      # Bitstream (snn_eth_top.bit) & reports
 ```
 
@@ -40,33 +39,22 @@ SNN_accelerator_eth/
 
 ## 🚀 Quick Start Guide
 
-### 1. Run Verification Simulation
-Before flashing the hardware, verify RTL logic with Vivado simulator:
-```bash
-cd tb
-./run_sim.sh
-```
 
-### 2. Flash Bitstream to Arty A7-100T FPGA
-Make sure your Arty A7 board is connected via USB-JTAG:
-```bash
-vivado -mode batch -source scripts/program_fpga.tcl
-```
-*(Or manually load `build/snn_eth_top.bit` using Vivado Hardware Manager)*
+### 1. Flash Bitstream to Arty A7-100T FPGA
 
-### 3. Build Host Application
+### 2. Build Host Application
 ```bash
 cd host
 make
 ```
 
-### 4. Ping FPGA over Ethernet
+### 3. Ping FPGA over Ethernet
 Test physical link and FPGA state:
 ```bash
 sudo ./snn_inference_eth --ifname eno1 --ping
 ```
 
-### 5. Run SNN Inference over Ethernet
+### 4. Run SNN Inference over Ethernet
 - **Single Image Inference:**
   ```bash
   sudo ./snn_inference_eth --ifname eno1 --weights ../data/weights.bin --image ../data/sample_collision_img.bin --ascii
